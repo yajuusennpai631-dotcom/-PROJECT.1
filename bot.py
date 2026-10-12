@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 import discord
 from discord import app_commands
 from discord.ext import commands
-from groq import APIConnectionError, APIStatusError, AsyncGroq, RateLimitError
+from groq import APIConnectionError, APIStatusError, AsyncGroq, NotFoundError, RateLimitError
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -36,7 +36,17 @@ OWNER_IDS = {
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_HISTORY = 10       # ユーザーごとに保持する会話数(発言単位)
 MAX_INPUT_CHARS = 500  # 入力の最大文字数
-MAX_TOKENS = 400
+MAX_TOKENS = 1000      # 推論系モデルは思考にもトークンを使うため余裕を持たせる
+
+# 設定したモデルが使えない場合に、この順で現行モデルから自動選択する
+FALLBACK_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+# チャット用ではないモデルを除外するためのキーワード
+NON_CHAT_KEYWORDS = ("whisper", "tts", "guard", "orpheus", "embed", "safeguard", "compound")
 
 # キャラクター設定(公式の台詞は使わず、性格をオリジナルの文章で記述)
 SYSTEM_PROMPT = """\
@@ -72,6 +82,44 @@ class Takina(commands.Cog):
         if not self.client:
             log.warning("GROQ_API_KEY が未設定のため、たきなAIは無効です")
         self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+        self.model = GROQ_MODEL
+
+    async def _pick_model(self) -> str | None:
+        """Groqの現行モデル一覧から、使えるチャットモデルを選ぶ。"""
+        listed = await self.client.models.list()
+        ids = [m.id for m in listed.data]
+        log.info("Groqの利用可能モデル: %s", ", ".join(ids))
+        for name in FALLBACK_MODELS:
+            if name in ids:
+                return name
+        chat = [i for i in ids if not any(k in i.lower() for k in NON_CHAT_KEYWORDS)]
+        return chat[0] if chat else None
+
+    async def _complete(self, messages: list[dict]) -> str:
+        """Groqに問い合わせる。モデルが無い場合は一度だけ自動で選び直す。"""
+        for attempt in range(2):
+            kwargs = {}
+            if "gpt-oss" in self.model:
+                kwargs["extra_body"] = {"reasoning_effort": "low"}
+            try:
+                completion = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=MAX_TOKENS,
+                    **kwargs,
+                )
+                return (completion.choices[0].message.content or "").strip()
+            except NotFoundError:
+                if attempt == 1:
+                    raise
+                log.warning("モデル %s が使えないため、別のモデルを探します", self.model)
+                new_model = await self._pick_model()
+                if not new_model or new_model == self.model:
+                    raise
+                log.info("モデルを %s に切り替えました", new_model)
+                self.model = new_model
+        return ""
 
     async def cog_unload(self) -> None:
         if self.client:
@@ -97,13 +145,7 @@ class Takina(commands.Cog):
         messages.append({"role": "user", "content": message})
 
         try:
-            completion = await self.client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=MAX_TOKENS,
-            )
-            reply = (completion.choices[0].message.content or "……").strip()
+            reply = await self._complete(messages) or "……"
         except RateLimitError:
             await interaction.followup.send(
                 "……少し混み合っています。時間をおいてもう一度話しかけてください。"
