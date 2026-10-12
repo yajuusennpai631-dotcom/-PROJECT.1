@@ -28,6 +28,11 @@ GUILD_ID = os.getenv("GUILD_ID")
 # ステータスに表示する名前
 STATUS_NAME = "タピタキ"
 
+# /sync を使えるユーザーID(カンマ区切り・任意)。未設定ならBOTの所有者のみ
+OWNER_IDS = {
+    int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
+
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_HISTORY = 10       # ユーザーごとに保持する会話数(発言単位)
 MAX_INPUT_CHARS = 500  # 入力の最大文字数
@@ -189,10 +194,56 @@ async def ping(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(f"Pong! {latency_ms}ms")
 
 
+async def is_bot_owner(interaction: discord.Interaction) -> bool:
+    """BOTの所有者(または環境変数 OWNER_IDS に含まれるユーザー)のみ許可する。"""
+    if interaction.user.id in OWNER_IDS:
+        return True
+    return await interaction.client.is_owner(interaction.user)
+
+
+@bot.tree.command(name="sync", description="スラッシュコマンドをDiscordに同期します(管理者専用)")
+@app_commands.describe(scope="同期する範囲")
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="このサーバーのみ(即時反映)", value="guild"),
+        app_commands.Choice(name="全サーバー(反映まで最大1時間)", value="global"),
+    ]
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.check(is_bot_owner)
+async def sync(
+    interaction: discord.Interaction,
+    scope: app_commands.Choice[str] = None,
+) -> None:
+    mode = scope.value if scope else "guild"
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if mode == "guild":
+        if interaction.guild is None:
+            await interaction.followup.send("サーバー内で実行してください。")
+            return
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+        where = f"サーバー「{interaction.guild.name}」"
+    else:
+        synced = await bot.tree.sync()
+        where = "全サーバー"
+
+    log.info("/sync 実行: %s (%d件) by %s", where, len(synced), interaction.user)
+    await interaction.followup.send(f"{where}に {len(synced)} 件のコマンドを同期しました。")
+
+
 @bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ) -> None:
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "このコマンドはBOTの管理者のみ使用できます。"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
     log.exception("コマンドエラー", exc_info=error)
     msg = "エラーが発生しました。"
     if interaction.response.is_done():
