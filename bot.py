@@ -1,6 +1,7 @@
-"""Groq APIを使った「たきなAI」(ファンメイドのキャラクターAI)。"""
+"""Railway上で動かすDiscord BOT(たきなAI入り・単一ファイル版)。"""
 import logging
 import os
+import sys
 from collections import defaultdict, deque
 
 import discord
@@ -8,10 +9,27 @@ from discord import app_commands
 from discord.ext import commands
 from groq import APIConnectionError, APIStatusError, AsyncGroq, RateLimitError
 
-log = logging.getLogger("bot.takina")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,  # Railwayのログに表示されるよう標準出力へ
+)
+log = logging.getLogger("bot")
+
+# ===== 設定 =====
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    log.error("環境変数 DISCORD_TOKEN が設定されていません")
+    sys.exit(1)
+
+# 開発中はギルドIDを指定するとスラッシュコマンドが即時反映される(任意)
+GUILD_ID = os.getenv("GUILD_ID")
+
+# ステータスに表示する名前
+STATUS_NAME = "タピタキ"
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-MAX_HISTORY = 10      # ユーザーごとに保持する会話数(発言単位)
+MAX_HISTORY = 10       # ユーザーごとに保持する会話数(発言単位)
 MAX_INPUT_CHARS = 500  # 入力の最大文字数
 MAX_TOKENS = 400
 
@@ -40,6 +58,7 @@ Discordで会話相手(ユーザー)とチャットします。
 """
 
 
+# ===== たきなAI(Cog) =====
 class Takina(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -120,5 +139,67 @@ class Takina(commands.Cog):
         )
 
 
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Takina(bot))
+# ===== BOT本体 =====
+intents = discord.Intents.default()
+# メッセージ内容を読む場合のみ有効化(Developer Portalでの設定も必要)
+# intents.message_content = True
+
+
+class MyBot(commands.Bot):
+    def __init__(self) -> None:
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self) -> None:
+        await self.add_cog(Takina(self))  # 同期の前にCogを登録する
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+        log.info("スラッシュコマンドを同期しました")
+
+    async def update_presence(self) -> None:
+        """ステータスに「タピタキ」と導入サーバー数を表示する。"""
+        count = len(self.guilds)
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=discord.Game(name=f"{STATUS_NAME} | {count}サーバー"),
+        )
+
+    async def on_ready(self) -> None:
+        log.info("ログインしました: %s (ID: %s)", self.user, self.user.id)
+        await self.update_presence()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("サーバーに参加: %s (ID: %s)", guild.name, guild.id)
+        await self.update_presence()
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        log.info("サーバーから退出: %s (ID: %s)", guild.name, guild.id)
+        await self.update_presence()
+
+
+bot = MyBot()
+
+
+@bot.tree.command(name="ping", description="BOTの応答速度を確認します")
+async def ping(interaction: discord.Interaction) -> None:
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"Pong! {latency_ms}ms")
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    log.exception("コマンドエラー", exc_info=error)
+    msg = "エラーが発生しました。"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN, log_handler=None)
