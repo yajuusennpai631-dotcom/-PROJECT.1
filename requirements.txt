@@ -1,3 +1,2 @@
 discord.py>=2.4,<3
 groq>=0.13
-PYTHONUNBUFFERED=1
